@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,6 +51,13 @@ type server struct {
 
 	leaseMu sync.Mutex
 	leaseID string
+
+	portMu   sync.Mutex
+	portFree []int // ports believed free, in order; nil = not read yet
+
+	// how many copies of nostromo share the datastore: every node's tunnel
+	// agent must end up connected to each of them
+	instances atomic.Int32
 
 	warmQueue chan *tenant // clusters waiting for their first boot
 
@@ -127,32 +135,82 @@ func (s *server) keepLease(ctx context.Context) {
 			s.leaseID = id
 			s.leaseMu.Unlock()
 			renewed = time.Now()
+			s.announce()
 		}
+	}
+}
+
+// announce records this instance among the running ones, for as long as its
+// lease lives.
+func (s *server) announce() {
+	if _, _, err := s.etcd.putIfAbsent(instancesPrefix+s.instance, []byte(s.instance), s.lease()); err != nil {
+		log.Printf("announcing this instance: %v", err)
+	}
+	s.countInstances()
+}
+
+// countInstances looks at how many instances are running. When the number
+// changes, the tunnel servers are restarted with the new one: it is from
+// them that the nodes' agents learn how many servers to look for.
+func (s *server) countInstances() {
+	l, err := s.etcd.list(instancesPrefix)
+	if err != nil {
+		return
+	}
+	n := int32(max(len(l), 1))
+	if s.instances.Swap(n) == n {
+		return
+	}
+	log.Printf("%d instance(s) of nostromo share the datastore", n)
+	for _, t := range s.list() {
+		t.mu.Lock()
+		if t.tunnel != nil {
+			t.tunnel.stop()
+			t.startTunnel()
+		}
+		t.mu.Unlock()
 	}
 }
 
 // reservePort picks a free dedicated port and reserves it for the cluster.
 func (s *server) reservePort(name string) (int, error) {
-	taken, err := s.etcd.list(portsPrefix)
-	if err != nil {
-		return 0, err
-	}
-	used := map[int]bool{}
-	for _, k := range taken {
-		p, _ := strconv.Atoi(strings.TrimPrefix(k.key, portsPrefix))
-		used[p] = true
-	}
-	for p := s.portMin; p <= s.portMax; p++ {
-		if used[p] {
-			continue
+	s.portMu.Lock()
+	defer s.portMu.Unlock()
+	// Reading every reservation at each creation would make creation slower
+	// the more clusters there are. The list is read once, then ports are
+	// tried in order from where the last search stopped; the datastore
+	// refuses a port someone else holds. Ports freed by deleted clusters are
+	// found again by a fresh read when the range has been walked to its end.
+	for pass := 0; pass < 2; pass++ {
+		if s.portFree == nil {
+			taken, err := s.etcd.list(portsPrefix)
+			if err != nil {
+				return 0, err
+			}
+			used := map[int]bool{}
+			for _, k := range taken {
+				p, _ := strconv.Atoi(strings.TrimPrefix(k.key, portsPrefix))
+				used[p] = true
+			}
+			s.portFree = []int{}
+			for p := s.portMin; p <= s.portMax; p++ {
+				if !used[p] {
+					s.portFree = append(s.portFree, p)
+				}
+			}
 		}
-		ok, _, err := s.etcd.putIfAbsent(portsPrefix+strconv.Itoa(p), []byte(name), "")
-		if err != nil {
-			return 0, err
+		for len(s.portFree) > 0 {
+			p := s.portFree[0]
+			s.portFree = s.portFree[1:]
+			ok, _, err := s.etcd.putIfAbsent(portsPrefix+strconv.Itoa(p), []byte(name), "")
+			if err != nil {
+				return 0, err
+			}
+			if ok { // otherwise another instance took it meanwhile: try the next
+				return p, nil
+			}
 		}
-		if ok { // otherwise another instance took it meanwhile: try the next
-			return p, nil
-		}
+		s.portFree = nil // walked to the end: look again, once
 	}
 	return 0, fmt.Errorf("no free port left in %d-%d", s.portMin, s.portMax)
 }
@@ -288,7 +346,26 @@ func (s *server) loadTenant(m tenantMeta) (*tenant, error) {
 					if err != nil {
 						return
 					}
-					go t.forward(c, nil)
+					go t.forward(c, nil, false)
+				}
+			}()
+		}
+	}
+	if t.tunnelEnabled() {
+		// Agents are answered by nostromo, which hands them to the cluster's
+		// tunnel server, waking the cluster first if it sleeps here.
+		l, err := net.Listen("tcp", net.JoinHostPort(s.listenHost, strconv.Itoa(t.AgentPort)))
+		if err != nil {
+			log.Printf("[%s] agent port %d not available here: %v", t.Name, t.AgentPort, err)
+		} else {
+			t.agentListener = l
+			go func() {
+				for {
+					c, err := l.Accept()
+					if err != nil {
+						return
+					}
+					go t.forward(c, nil, true)
 				}
 			}()
 		}
@@ -308,6 +385,9 @@ func (s *server) unloadTenant(name string) {
 	}
 	if t.listener != nil {
 		t.listener.Close()
+	}
+	if t.agentListener != nil {
+		t.agentListener.Close()
 	}
 	t.mu.Lock()
 	t.sleep()
@@ -437,7 +517,7 @@ func (s *server) serveShared(l net.Listener) {
 				c.Close()
 				return
 			}
-			t.forward(c, consumed)
+			t.forward(c, consumed, false)
 		}()
 	}
 }
@@ -460,6 +540,10 @@ func (s *server) onEvent(ev etcdEvent) {
 				}
 			}()
 		}
+		return
+	}
+	if strings.HasPrefix(ev.key, instancesPrefix) {
+		go s.countInstances()
 		return
 	}
 	rest, ok := strings.CutPrefix(ev.key, rootPrefix)
@@ -500,6 +584,7 @@ func (s *server) onWatchLost() {
 	if err := s.syncTenants(); err != nil {
 		log.Printf("reading the cluster list: %v", err)
 	}
+	s.countInstances()
 	now := time.Now().UnixNano()
 	for _, t := range s.list() {
 		t.lastWrite.Store(now)
@@ -552,10 +637,16 @@ func (s *server) adjust(t *tenant) {
 	}
 	// A cluster with nodes never sleeps: expiring certificates are renewed
 	// here, once a day (the processes reload the files on their own).
-	if now.Sub(t.lastRenewal) > 24*time.Hour {
+	if now.Sub(t.lastRenewal) > renewalCheck {
 		t.lastRenewal = now
+		before, _ := os.ReadFile(t.file("apiserver.crt"))
 		if err := t.prepare(); err != nil {
 			log.Printf("[%s] certificate renewal: %v", t.Name, err)
+		}
+		// the tunnel server reads its certificate only when it starts
+		if after, _ := os.ReadFile(t.file("apiserver.crt")); t.tunnel != nil && !bytes.Equal(before, after) {
+			t.tunnel.stop()
+			t.startTunnel()
 		}
 	}
 	if t.tunnel != nil && !t.tunnel.alive() { // the tunnel server died: bring it back
@@ -663,6 +754,24 @@ networking:
   podSubnet: %q
   dnsDomain: cluster.local
 `, version.GitVersion, t.nodeEndpoint(), s.serviceCIDR, s.podCIDR)
+	// kubeadm wants to know "this machine's address" and, left alone, looks
+	// for a default route: say it here, so that preparing a cluster does not
+	// depend on how this machine reaches the internet.
+	advertise := net.ParseIP(s.nodeAddress)
+	if advertise == nil {
+		if ips, err := net.LookupIP(s.nodeAddress); err == nil && len(ips) > 0 {
+			advertise = ips[0]
+		}
+	}
+	if advertise != nil {
+		cfg += fmt.Sprintf(`---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: %q
+  bindPort: %d
+`, advertise.String(), t.Port)
+	}
 	if err := writeAtomic(cfgFile, []byte(cfg)); err != nil {
 		return "", err
 	}
@@ -719,6 +828,7 @@ type tenantStatus struct {
 	Name         string `json:"name"`
 	Level        string `json:"level"` // asleep | waking | standby | full
 	Port         int    `json:"port"`
+	AgentPort    int    `json:"agent_port"` // where nodes keep the tunnel open
 	Connections  int    `json:"connections"`
 	Nodes        int    `json:"nodes"`
 	ApiMB        int    `json:"api_mb"`
@@ -737,10 +847,10 @@ func (s *server) status() map[string]any {
 	for _, t := range s.list() {
 		if !t.mu.TryLock() { // busy starting or stopping: do not make the caller wait
 			levels["waking"]++
-			ts = append(ts, tenantStatus{Name: t.Name, Level: "waking", Port: t.Port})
+			ts = append(ts, tenantStatus{Name: t.Name, Level: "waking", Port: t.Port, AgentPort: t.AgentPort})
 			continue
 		}
-		st := tenantStatus{Name: t.Name, Level: "asleep", Port: t.Port, Connections: t.conns, Nodes: t.nodeCount(),
+		st := tenantStatus{Name: t.Name, Level: "asleep", Port: t.Port, AgentPort: t.AgentPort, Connections: t.conns, Nodes: t.nodeCount(),
 			ApiMB: t.api.rssMB(), EnginesMB: t.cm.rssMB() + t.sc.rssMB(), TunnelMB: t.tunnel.rssMB(), Wakes: t.wakes, LastWakeMs: t.lastWakeMs,
 			EngineStarts: t.engineStarts, LastReason: t.lastReason}
 		if t.api.alive() {

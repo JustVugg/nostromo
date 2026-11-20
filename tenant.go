@@ -41,6 +41,8 @@ type tenant struct {
 	dir      string
 	srv      *server
 	listener net.Listener
+	agentListener net.Listener // where the nodes' tunnel agents call
+	tunnelPort    int          // where the tunnel server takes them, on this machine
 
 	mu           sync.Mutex
 	api, cm, sc  *process
@@ -243,12 +245,11 @@ func (t *tenant) kubeClient() (*http.Client, error) {
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(ca)
-	cert, err := tls.LoadX509KeyPair(t.file("admin.crt"), t.file("admin.key"))
-	if err != nil {
+	if _, err := tls.LoadX509KeyPair(t.file("admin.crt"), t.file("admin.key")); err != nil {
 		return nil, err
 	}
 	return &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{
-		TLSClientConfig:   &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{cert}, ServerName: "localhost"},
+		TLSClientConfig:   &tls.Config{RootCAs: pool, GetClientCertificate: fromFiles(t.file("admin.crt"), t.file("admin.key")), ServerName: "localhost"},
 		DisableKeepAlives: true,
 	}}, nil
 }
@@ -535,11 +536,16 @@ func (t *tenant) sleep() {
 
 // forward relays a connection to the apiserver, waking it up if needed.
 // Traffic stays encrypted end to end: nostromo never opens it.
-func (t *tenant) forward(c net.Conn, consumed []byte) {
+// forward relays a connection to the cluster's apiserver or, for a node's
+// tunnel agent, to its tunnel server, waking the cluster first if needed.
+func (t *tenant) forward(c net.Conn, consumed []byte, agent bool) {
 	defer c.Close()
 	t.mu.Lock()
 	err := t.wake()
 	port := t.internalPort
+	if agent {
+		port = t.tunnelPort
+	}
 	if err == nil {
 		t.conns++
 		t.warming = false
@@ -556,6 +562,13 @@ func (t *tenant) forward(c net.Conn, consumed []byte) {
 		t.mu.Unlock()
 	}()
 	b, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+	for i := 0; err != nil && agent && i < 20; i++ { // the tunnel server may still be starting
+		time.Sleep(250 * time.Millisecond)
+		t.mu.Lock()
+		port = t.tunnelPort
+		t.mu.Unlock()
+		b, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+	}
 	if err != nil {
 		return
 	}

@@ -78,6 +78,10 @@ func (t *tenant) startTunnel() {
 	admin, _ := freePort()
 	health, _ := freePort()
 	var err error
+	if t.tunnelPort, err = freePort(); err != nil {
+		log.Printf("[%s] tunnel: %v", t.Name, err)
+		return
+	}
 	t.tunnel, err = start(t.file("konnectivity.log"), s.childEnv, s.tunnelBinary(),
 		"--logtostderr=true",
 		"--mode=grpc",
@@ -86,8 +90,12 @@ func (t *tenant) startTunnel() {
 		"--proxy-strategies=destHost,default",
 		// apiserver side: a local socket
 		"--uds-name="+t.socket(), "--delete-existing-uds-file", "--server-port=0",
-		// agent side: the cluster's agent port, encrypted with the cluster's own certificate
-		"--agent-bind-address="+s.listenHost, fmt.Sprintf("--agent-port=%d", t.AgentPort),
+		// agent side: nostromo relays here what arrives at the cluster's agent
+		// port; encrypted end to end with the cluster's own certificate
+		"--agent-bind-address=127.0.0.1", fmt.Sprintf("--agent-port=%d", t.tunnelPort),
+		// with several instances behind one address, an agent keeps calling
+		// until it is connected to every one of them
+		"--server-id="+s.instance, fmt.Sprintf("--server-count=%d", max(s.instances.Load(), 1)),
 		"--cluster-cert="+t.file("apiserver.crt"), "--cluster-key="+t.file("apiserver.key"),
 		// agents prove who they are with a token only this cluster can have issued
 		"--kubeconfig="+t.file("konnectivity.kubeconfig"),
@@ -132,6 +140,7 @@ func (t *tenant) installTunnelAgent() error {
 						"args": []string{
 							"--logtostderr=true",
 							"--agent-identifiers=host=$(HOST_IP)", // lets the server pick this agent for this node
+							"--sync-forever=true",                 // notice instances of nostromo added later
 							"--ca-cert=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
 							"--proxy-server-host=" + s.nodeAddress,
 							fmt.Sprintf("--proxy-server-port=%d", t.AgentPort),

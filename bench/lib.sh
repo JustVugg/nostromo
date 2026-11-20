@@ -7,6 +7,7 @@ K="$TOOLS/k8s/kubectl"
 D="$(mktemp -d "${TMPDIR:-/tmp}/nostromo-bench.XXXXXX")"
 N="$D/nostromo"
 ADMIN=127.0.0.1:7070
+export NOSTROMO_DIR="$D/data"   # where the commands find the API's token
 export GOTOOLCHAIN=local GOPROXY=off
 
 ( cd "$HERE" && "$TOOLS/go/bin/go" build -buildvcs=false -o "$N" . \
@@ -32,9 +33,9 @@ up() {
 }
 
 # status FIELD: a top-level field of the status document.
-status() { curl -m 5 -s "http://$ADMIN/status" | python3 -I -c "import sys,json; print(json.load(sys.stdin)['$1'])"; }
+status() { "$N" status -admin "$ADMIN" | python3 -I -c "import sys,json; print(json.load(sys.stdin)['$1'])"; }
 # cluster NAME FIELD: a field of one cluster.
-cluster() { curl -m 5 -s "http://$ADMIN/status" | python3 -I -c "import sys,json; print(*[t['$2'] for t in json.load(sys.stdin)['list'] if t['name']=='$1'])"; }
+cluster() { "$N" status -admin "$ADMIN" | python3 -I -c "import sys,json; print(*[t['$2'] for t in json.load(sys.stdin)['list'] if t['name']=='$1'])"; }
 # k NAME args...: kubectl against a cluster (kubeconfig in $D/NAME.kc).
 k() { local c=$1; shift; "$K" --kubeconfig "$D/$c.kc" --request-timeout=60s "$@"; }
 

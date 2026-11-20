@@ -48,7 +48,7 @@ echo "$OUT" | grep -q "10.96.0.1"; check $? "the cluster's DNS resolves service 
 echo
 k get pods -A -o wide 2>&1 | sed 's/^/  /' | cut -c1-130
 echo
-"$STATE/nostromo" list 2>/dev/null | sed 's/^/  /'
+NOSTROMO_DIR="$STATE/data" "$STATE/nostromo" list 2>/dev/null | sed 's/^/  /'
 echo
 if [ "$FAILED" = 0 ]; then echo "ALL OK"; else echo "$FAILED checks failed"; fi
 exit "$FAILED"

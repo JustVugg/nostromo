@@ -7,6 +7,7 @@
 //	nostromo kubeconfig NAME    print the file to connect with
 //	nostromo join NAME          print the command that joins a worker node
 //	nostromo list               show clusters and their level
+//	nostromo status             the same, in full, as JSON
 //	nostromo delete NAME        delete a cluster and its data
 package main
 
@@ -38,7 +39,7 @@ func main() {
 		serve(os.Args[2:])
 	case "datastore":
 		datastore(os.Args[2:])
-	case "create", "kubeconfig", "join", "list", "delete":
+	case "create", "kubeconfig", "join", "list", "status", "delete":
 		client(os.Args[1], os.Args[2:])
 	default:
 		usage()
@@ -53,8 +54,16 @@ func usage() {
   nostromo kubeconfig NAME       print the file to connect with kubectl
   nostromo join NAME             print the command that joins a worker node
   nostromo list                  show clusters and their level
+  nostromo status                the same, in full, as JSON
   nostromo delete NAME           delete a cluster and all its data`)
 	os.Exit(2)
+}
+
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func defaultTools() string { return filepath.Join(os.Getenv("HOME"), "nostromo-tools") }
@@ -65,6 +74,7 @@ func datastore(args []string) {
 	f := flag.NewFlagSet("datastore", flag.ExitOnError)
 	dir := f.String("dir", "./datastore", "data directory (its pki/ subdirectory holds the credentials instances need)")
 	tools := f.String("tools", defaultTools(), "directory holding k8s/ and etcd/ binaries")
+	listen := f.String("listen", "127.0.0.1:12379", "address the datastore listens on; instances on other machines need one they can reach")
 	f.Parse(args)
 	abs, err := filepath.Abs(*dir)
 	if err != nil {
@@ -73,13 +83,14 @@ func datastore(args []string) {
 	if err := os.MkdirAll(abs, 0o700); err != nil {
 		log.Fatal(err)
 	}
-	e, err := startEtcd(abs, *tools)
+	e, err := startEtcd(abs, *tools, *listen)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("datastore ready on %s, credentials in %s", e.url, e.dir)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	go e.keepFresh(ctx)
 	select {
 	case <-ctx.Done():
 	case <-e.proc.done:
@@ -97,7 +108,7 @@ func serve(args []string) {
 	nodeAddress := f.String("node-address", "", "IP address worker nodes and pods use to reach nostromo (not a loopback one); needed for nodes")
 	ports := f.String("ports", "30000-39999", "range of dedicated ports, one per cluster")
 	domain := f.String("domain", "nostromo.local", "clusters are named NAME.domain")
-	admin := f.String("admin", "127.0.0.1:7070", "management API address (no authentication: keep it local)")
+	admin := f.String("admin", "127.0.0.1:7070", "management API address (TLS; the token and the authority to trust are in the data directory)")
 	cidr := f.String("service-cidr", "10.96.0.0/12", "service network inside every cluster")
 	podCIDR := f.String("pod-cidr", "10.244.0.0/16", "pod network inside every cluster")
 	agentImage := f.String("tunnel-agent-image", "registry.k8s.io/kas-network-proxy/proxy-agent:v0.37.1", "container image of the tunnel agent (Konnectivity) installed on nodes")
@@ -167,7 +178,7 @@ func serve(args []string) {
 			err = s.etcd.setup()
 		}
 	} else {
-		s.etcd, err = startEtcd(abs, *tools)
+		s.etcd, err = startEtcd(abs, *tools, "")
 	}
 	if err != nil {
 		log.Fatal(err)
@@ -179,6 +190,7 @@ func serve(args []string) {
 	if s.leaseID, err = s.etcd.grantLease(leaseSeconds); err != nil {
 		die(err)
 	}
+	s.announce()
 	if err := s.syncTenants(); err != nil {
 		die(err)
 	}
@@ -192,19 +204,29 @@ func serve(args []string) {
 	defer stop()
 	go s.etcd.watch(ctx, s.onEvent, s.onWatchLost)
 	go s.keepLease(ctx)
+	go s.etcd.keepFresh(ctx)
 	go s.supervise(ctx)
 	for i := 0; i < *warm; i++ {
 		go s.warm(ctx)
 	}
 
-	h := &http.Server{Addr: *admin, Handler: s.adminAPI()}
+	token, err := adminToken(abs)
+	if err != nil {
+		die(err)
+	}
+	adminHost, _, _ := net.SplitHostPort(*admin)
+	adminCfg, err := adminTLS(abs, adminHost, *address)
+	if err != nil {
+		die(err)
+	}
+	h := &http.Server{Addr: *admin, Handler: withToken(token, s.adminAPI()), TLSConfig: adminCfg}
 	go func() {
-		if err := h.ListenAndServe(); err != http.ErrServerClosed {
+		if err := h.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
 			log.Printf("admin API: %v", err)
 			stop()
 		}
 	}()
-	log.Printf("nostromo ready: instance %s, clusters on %s, admin API on http://%s, %d clusters", s.instance, *listen, *admin, len(s.tenants))
+	log.Printf("nostromo ready: instance %s, clusters on %s, admin API on https://%s, %d clusters", s.instance, *listen, *admin, len(s.tenants))
 
 	<-ctx.Done()
 	log.Print("shutting down...")
@@ -223,19 +245,26 @@ func serve(args []string) {
 func client(command string, args []string) {
 	f := flag.NewFlagSet(command, flag.ExitOnError)
 	admin := f.String("admin", "127.0.0.1:7070", "management API address")
+	dir := f.String("dir", envOr("NOSTROMO_DIR", "./data"), "nostromo's data directory, where the API's token and authority are (or NOSTROMO_DIR)")
 	name := ""
-	if command != "list" {
+	if command != "list" && command != "status" {
 		if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 			usage()
 		}
 		name, args = args[0], args[1:]
 	}
 	f.Parse(args)
-	base := "http://" + *admin
-	cl := &http.Client{Timeout: 5 * time.Minute}
+	base := "https://" + *admin
+	cl, token, err := adminClient(*dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+	cl.Timeout = 5 * time.Minute
 
 	do := func(method, path string) []byte {
 		r, _ := http.NewRequest(method, base+path, nil)
+		r.Header.Set("Authorization", "Bearer "+token)
 		res, err := cl.Do(r)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "nostromo is not answering on", *admin, "-", err)
@@ -265,6 +294,8 @@ func client(command string, args []string) {
 	case "delete":
 		do("DELETE", "/cluster/"+name)
 		fmt.Println("cluster", name, "deleted")
+	case "status":
+		os.Stdout.Write(do("GET", "/status"))
 	case "list":
 		var st struct {
 			ClustersMem int `json:"clusters_mem_mb"`

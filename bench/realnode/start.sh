@@ -8,6 +8,7 @@ HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 TOOLS="${NOSTROMO_TOOLS:-$HOME/nostromo-tools}"
 STATE="$HOME/nostromo-realnode"
 N="$STATE/nostromo"
+export NOSTROMO_DIR="$STATE/data"
 
 IP="$(ip -4 -o addr show lo | awk '{print $4}' | cut -d/ -f1 | grep -v '^127\.' | head -1)"
 [ -n "$IP" ] || IP="$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)"

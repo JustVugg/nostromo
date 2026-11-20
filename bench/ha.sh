@@ -20,24 +20,24 @@ instance() { # instance LETTER SHARED_PORT ADMIN
   LAST=$!
   for _ in $(seq 1 100); do
     kill -0 $LAST 2>/dev/null || { echo "instance $1 did not start"; tail -5 "$D/$1.log"; exit 1; }
-    grep -q "nostromo ready" "$D/$1.log" && [ "$(curl -m 2 -s "http://$3/status" | grep -c instance)" = 1 ] && return; nap 0.2
+    grep -q "nostromo ready" "$D/$1.log" && [ "$("$N" status -admin "$3" -dir "$D/$1" 2>/dev/null | grep -c instance)" = 1 ] && return; nap 0.2
   done
 }
 instance a 6443 $A; PA=$LAST
 instance b 6444 $B; PB=$LAST
 EXTRA_PIDS="$DS $PA $PB"
-on() { local adm=$1; shift; ADMIN=$adm "$@"; }
+on() { local adm=$1 dir="$D/a"; shift; [ "$adm" = "$B" ] && dir="$D/b"; ADMIN=$adm NOSTROMO_DIR="$dir" "$@"; }
 full_count() { echo $(( $( [ "$(on $A cluster alpha level)" = full ] && echo 1 || echo 0 ) + $( [ "$(on $B cluster alpha level)" = full ] && echo 1 || echo 0 ) )); }
 
 echo "shared cluster list"
-"$N" create alpha -admin $A >/dev/null; check $? "cluster created through instance A"
+"$N" create alpha -admin $A -dir "$D/a" >/dev/null; check $? "cluster created through instance A"
 OK=1; for _ in $(seq 1 20); do [ "$(on $B cluster alpha level)" = asleep ] && { OK=0; break; }; nap 0.5; done
 check $OK "instance B knows the cluster too"
-not "$N" create alpha -admin $B; check $? "B refuses to create the same name again"
+not "$N" create alpha -admin $B -dir "$D/b"; check $? "B refuses to create the same name again"
 
 echo "same cluster from both"
-"$N" kubeconfig alpha -admin $A >"$D/alpha.kc"
-"$N" kubeconfig alpha -admin $B >"$D/alphab.kc"
+"$N" kubeconfig alpha -admin $A -dir "$D/a" >"$D/alpha.kc"
+"$N" kubeconfig alpha -admin $B -dir "$D/b" >"$D/alphab.kc"
 k alpha create namespace made-via-a >/dev/null; check $? "data written through A"
 [ "$(k alphab get namespace made-via-a -o name 2>/dev/null)" = namespace/made-via-a ]; check $? "the same data is read through B"
 sed 's/127.0.0.1:6443/127.0.0.1:6444/' "$D/alpha.kc" >"$D/cross.kc"
@@ -66,7 +66,7 @@ echo "  B: level=$(on $B cluster alpha level) reason=$(on $B cluster alpha last_
 echo "deletion seen everywhere"
 instance a 6443 $A; PA=$LAST; EXTRA_PIDS="$DS $PA $PB"
 [ "$(on $A cluster alpha level)" != "" ]; check $? "A restarted and found the cluster in the datastore"
-"$N" delete alpha -admin $B >/dev/null; check $? "cluster deleted through B"
+"$N" delete alpha -admin $B -dir "$D/b" >/dev/null; check $? "cluster deleted through B"
 OK=1; for _ in $(seq 1 20); do [ "$(on $A cluster alpha level)" = "" ] && { OK=0; break; }; nap 0.5; done
 check $OK "A dropped it too"
 

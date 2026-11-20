@@ -60,12 +60,28 @@ creation and goes back to sleep, so its first user only waits a normal wake-up.
   engines, and if it dies another takes over within half a minute.
 - **No dependencies**: a single Go binary, standard library only.
 
+## Try it
+
+On any Linux machine (x86-64 or arm64), without root:
+
+```sh
+git clone https://github.com/JustVugg/nostromo && cd nostromo
+./quickstart.sh
+```
+
+It fetches the Kubernetes and etcd binaries (checksums verified) into
+`~/nostromo-tools`, plus the Go toolchain if the machine has none, builds the
+tunnel server and nostromo, starts it, creates a cluster and shows it
+answering `kubectl`: about four minutes the first time, seconds afterwards.
+Nothing is installed system-wide; `./quickstart.sh stop --purge` and deleting
+`~/nostromo-tools` undo everything.
+
 ## Usage
 
-The binaries are expected in `~/nostromo-tools` (`k8s/kube-apiserver`,
+nostromo looks for the binaries in `~/nostromo-tools` (`k8s/kube-apiserver`,
 `k8s/kube-controller-manager`, `k8s/kube-scheduler`, `k8s/kubeadm`,
-`etcd/etcd`) and, for the tunnel, `konnectivity/proxy-server` (built from
-kubernetes-sigs/apiserver-network-proxy; without it the tunnel is simply off).
+`etcd/etcd`, and for the tunnel `konnectivity/proxy-server`); `-tools` points
+it elsewhere. `quickstart.sh` puts them there.
 
 ```sh
 go build -o nostromo .
@@ -81,8 +97,12 @@ kubectl --kubeconfig alpha.kubeconfig get namespaces   # starts on its own
 
 `./nostromo serve -h` lists every option (timings, addresses, domain).
 
-The management API (`-admin`, 127.0.0.1:7070 by default) has no
-authentication: keep it on the loopback address.
+The commands talk to the running service through its management API
+(`-admin`, 127.0.0.1:7070 by default). The API speaks only TLS and wants a
+secret token; both the token and the authority to trust are created in the
+data directory (`admin.token`, `admin-ca.crt`), where the commands find them
+(`-dir` or `NOSTROMO_DIR`). To manage nostromo from another machine, copy
+those two files there.
 
 ### Worker nodes
 
@@ -104,13 +124,16 @@ and is not installed by nostromo.
 ### Several instances
 
 ```sh
-./nostromo datastore -dir ./ds &                       # or your own etcd cluster
-./nostromo serve -dir ./a -etcd https://127.0.0.1:12379 -pki ./ds/pki &   # on machine A
-./nostromo serve -dir ./b -etcd https://127.0.0.1:12379 -pki ./ds/pki &   # on machine B
+./nostromo datastore -dir ./ds -listen 10.0.0.5:12379 &     # or your own etcd cluster
+# on machine A and on machine B, each with a copy of ./ds/pki:
+./nostromo serve -dir ./data -etcd https://10.0.0.5:12379 -pki ./pki -address LB -node-address LB &
 ```
 
 Put a TCP load balancer in front of the instances and use its address as
-`-address` and `-node-address`. `nostromo datastore` runs a single etcd: for a
+`-address` and `-node-address`. Users, nodes and the nodes' tunnel agents
+all call that one address; each agent keeps calling until it is connected to
+every instance, so a node is reached whichever instance a request lands on.
+`nostromo datastore` runs a single etcd: for a
 datastore that survives a machine loss, run a regular multi-member etcd with
 the same credentials and point `-etcd` at it. Give that etcd
 `--auto-compaction-mode=periodic --auto-compaction-retention=4m`: the
@@ -147,6 +170,8 @@ bash bench/levels.sh     # the three levels with fake nodes (4 minutes)
 bash bench/nodes.sh      # dedicated port, kubeadm join, a node joining like a kubelet (1 minute)
 bash bench/tunnel.sh     # the control plane reaching a node through the tunnel (1 minute)
 bash bench/ha.sh         # two instances on one datastore, takeover (2 minutes)
+bash bench/tunnel-ha.sh  # two instances behind one address, a node reached through either (2 minutes)
+bash bench/certs.sh      # three certificate lifetimes on a cluster that never restarts (7 minutes)
 bash bench/density.sh 20 # memory and wake-up times
 bash bench/scale.sh      # 100 started clusters plus 1000 created
 ```
@@ -173,8 +198,9 @@ sudo bash bench/realnode/multinode.sh down
 
 ## Conformance
 
-The official Kubernetes conformance suite (v1.37.2, run with hydrophone) was
-run in full on a nostromo cluster with two real nodes, engines sleeping as
-usual: 461 of 462 tests passed. The one that failed hit a request timeout
-while the test laptop's disk was saturated by other work, and passed when run
-again on its own.
+The official Kubernetes conformance suite (v1.37.2, 462 tests, run with
+hydrophone) runs in full on a nostromo cluster with two real nodes, engines
+sleeping as usual. The latest full run, about two hours on a laptop: 460
+passed; the 2 that did not were waiting for a test image the nodes could not
+download from the registry in time, and both passed when run again. Every one
+of the 462 tests has passed on nostromo.

@@ -84,7 +84,7 @@ k exec "$FIRST" -- nslookup registry.k8s.io >/dev/null 2>&1; check $? "pods reso
 k exec "$FIRST" -- sh -c 'nc -w 5 registry.k8s.io 443 </dev/null' >/dev/null 2>&1; check $? "pods open connections to the internet"
 
 echo
-"$STATE/nostromo" list 2>/dev/null | sed 's/^/  /'
+NOSTROMO_DIR="$STATE/data" "$STATE/nostromo" list 2>/dev/null | sed 's/^/  /'
 echo
 if [ "$FAILED" = 0 ]; then echo "ALL OK"; else echo "$FAILED checks failed"; fi
 exit "$FAILED"

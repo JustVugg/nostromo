@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"fmt"
 	"io"
 	"log"
@@ -34,12 +35,14 @@ const (
 	portsPrefix   = metaPrefix + "ports/"   // port reservations
 	enginesPrefix = metaPrefix + "engines/" // which instance runs a cluster's engines
 	frontPrefix   = metaPrefix + "front/"   // each cluster's front-proxy CA (immutable)
+	instancesPrefix = metaPrefix + "instances/" // the running copies of nostromo
 )
 
 // etcd is the shared datastore. Every cluster has a user that can only touch
 // its own slice; nostromo itself uses the root user.
 type etcd struct {
 	dir  string // pki directory
+	host string // address the datastore listens on, when this process runs it
 	proc *process
 	ca   *keyPair
 	http *http.Client
@@ -62,7 +65,7 @@ func prefixEnd(p string) string {
 // ensureEtcdPKI creates, if missing, everything needed to run and reach the
 // datastore: its CA, its server certificate, nostromo's client certificate
 // and the root password.
-func ensureEtcdPKI(pki string) error {
+func ensureEtcdPKI(pki, host string) error {
 	if err := os.MkdirAll(pki, 0o700); err != nil {
 		return err
 	}
@@ -70,8 +73,20 @@ func ensureEtcdPKI(pki string) error {
 	if err != nil {
 		return err
 	}
-	if needsRenewal(pki, "etcd-server") {
-		c, err := ca.sign("etcd", nil, []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1")}, usageServerPeer)
+	covered := false // is the current certificate good for the address we listen on?
+	if c, err := loadKeyPair(pki, "etcd-server"); err == nil {
+		covered = c.cert.VerifyHostname(host) == nil
+	}
+	// host is empty when the datastore is run by someone else: only the
+	// client side is ours to keep fresh
+	if host != "" && (needsRenewal(pki, "etcd-server") || !covered) {
+		dns, ips := []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1")}
+		if ip := net.ParseIP(host); ip != nil {
+			ips = append(ips, ip)
+		} else {
+			dns = append(dns, host)
+		}
+		c, err := ca.sign("etcd", nil, dns, ips, usageServerPeer)
 		if err != nil {
 			return err
 		}
@@ -109,29 +124,84 @@ func connectEtcd(pki, url string) (*etcd, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, err := tls.LoadX509KeyPair(filepath.Join(pki, "etcd-root.crt"), filepath.Join(pki, "etcd-root.key"))
-	if err != nil {
+	if _, err := tls.LoadX509KeyPair(filepath.Join(pki, "etcd-root.crt"), filepath.Join(pki, "etcd-root.key")); err != nil {
 		return nil, err
 	}
 	pool := x509.NewCertPool()
 	pool.AddCert(ca.cert)
 	return &etcd{dir: pki, ca: ca, pw: strings.TrimSpace(string(pw)), url: url,
 		http: &http.Client{Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{root}},
+			TLSClientConfig: &tls.Config{RootCAs: pool,
+				GetClientCertificate: fromFiles(filepath.Join(pki, "etcd-root.crt"), filepath.Join(pki, "etcd-root.key"))},
 		}}}, nil
 }
 
-// startEtcd runs a local single-member datastore and connects to it.
-func startEtcd(data, tools string) (*etcd, error) {
+// keepFresh renews, while the process runs, the datastore certificates that
+// are about to expire. etcd and nostromo read the files again by themselves.
+func (e *etcd) keepFresh(ctx context.Context) {
+	tick := time.NewTicker(renewalCheck)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			if err := ensureEtcdPKI(e.dir, e.host); err != nil {
+				log.Printf("datastore certificates: %v", err)
+			}
+		}
+	}
+}
+
+// portFree reports whether nothing is listening on a local port.
+func portFree(host string, port int) bool {
+	l, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	l.Close()
+	return true
+}
+
+// startEtcd runs a single-member datastore and connects to it. With an empty
+// listen address the datastore is private to this nostromo: it stays on the
+// loopback address, on the usual port or, if that is taken (another nostromo
+// on the same machine), on any free one. A listen address (host:port) is for
+// a datastore that instances on other machines will reach.
+func startEtcd(data, tools, listen string) (*etcd, error) {
+	host, port, peerPort := "127.0.0.1", etcdPort, etcdPeerPort
+	if listen != "" {
+		h, p, err := net.SplitHostPort(listen)
+		if err != nil {
+			return nil, err
+		}
+		if host = h; host == "" {
+			return nil, errors.New("the datastore needs an explicit address to listen on")
+		}
+		if port, err = strconv.Atoi(p); err != nil {
+			return nil, err
+		}
+		peerPort = port + 1
+	} else if !portFree(host, port) || !portFree(host, peerPort) {
+		var err error
+		if port, err = freePort(); err != nil {
+			return nil, err
+		}
+		if peerPort, err = freePort(); err != nil {
+			return nil, err
+		}
+	}
+	etcdPeerPort := peerPort
 	pki := filepath.Join(data, "pki")
-	if err := ensureEtcdPKI(pki); err != nil {
+	if err := ensureEtcdPKI(pki, host); err != nil {
 		return nil, err
 	}
-	url := fmt.Sprintf("https://127.0.0.1:%d", etcdPort)
+	url := "https://" + net.JoinHostPort(host, strconv.Itoa(port))
 	e, err := connectEtcd(pki, url)
 	if err != nil {
 		return nil, err
 	}
+	e.host = host
 	e.proc, err = start(filepath.Join(data, "etcd.log"), nil, filepath.Join(tools, "etcd", "etcd"),
 		"--data-dir="+filepath.Join(data, "etcd"),
 		"--listen-client-urls="+url, "--advertise-client-urls="+url,

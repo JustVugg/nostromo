@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -15,11 +16,32 @@ import (
 	"time"
 )
 
-const (
-	caLifetime   = 10 * 365 * 24 * time.Hour
+const caLifetime = 10 * 365 * 24 * time.Hour
+
+var (
 	certLifetime = 365 * 24 * time.Hour
 	renewBefore  = 30 * 24 * time.Hour // a certificate is renewed when it has less than this left
+	renewalCheck = 24 * time.Hour      // how often running certificates are looked at
+)
 
+// NOSTROMO_TEST_CERT_LIFETIME shrinks the life of certificates so that the
+// tests can watch a year of renewals in a few minutes (bench/certs.sh).
+func init() {
+	if d, err := time.ParseDuration(os.Getenv("NOSTROMO_TEST_CERT_LIFETIME")); err == nil && d > 0 {
+		certLifetime, renewBefore, renewalCheck = d, d/2, d/6
+	}
+}
+
+// fromFiles gives a TLS client the certificate currently in two files, read
+// again at every new connection: renewed files are picked up without restarts.
+func fromFiles(crt, key string) func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	return func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		c, err := tls.LoadX509KeyPair(crt, key)
+		return &c, err
+	}
+}
+
+const (
 	usageServer     = 1
 	usageClient     = 2
 	usageServerPeer = usageServer | usageClient
