@@ -204,3 +204,7 @@ sleeping as usual. The latest full run, about two hours on a laptop: 460
 passed; the 2 that did not were waiting for a test image the nodes could not
 download from the registry in time, and both passed when run again. Every one
 of the 462 tests has passed on nostromo.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).
