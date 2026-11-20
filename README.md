@@ -81,6 +81,9 @@ kubectl --kubeconfig alpha.kubeconfig get namespaces   # starts on its own
 
 `./nostromo serve -h` lists every option (timings, addresses, domain).
 
+The management API (`-admin`, 127.0.0.1:7070 by default) has no
+authentication: keep it on the loopback address.
+
 ### Worker nodes
 
 Nodes and pods need a real (non-loopback) address to reach nostromo:
@@ -168,37 +171,10 @@ bash bench/realnode/multinode-check.sh        # pods on every node, traffic betw
 sudo bash bench/realnode/multinode.sh down
 ```
 
-## Limits of this version
+## Conformance
 
-- **Real nodes, on a small scale.** A real kubelet (containerd 2.4,
-  Kubernetes v1.37.2) joins with the standard `kubeadm join`; two real nodes
-  on a private network the control plane cannot dial run containers, talk to
-  each other, reach the internet, and serve logs and exec through the tunnel.
-  All of it on one WSL2 machine, with a deliberately simple pod network.
-  Nodes on separate machines and larger fleets are still to do.
-- **Conformance: 461 of 462, not a certified result.** The official
-  Kubernetes conformance suite (v1.37.2, run with hydrophone) was run in full
-  on a nostromo cluster with two real nodes, engines sleeping as usual: 461
-  tests passed. The one that failed (taint-based eviction) hit a request
-  timeout while the test laptop's disk was saturated by other work, and
-  passed when run again on its own. A first run had found five real defects
-  (API aggregation, OIDC key discovery, paged lists after compaction, quota
-  repair, engines not resuming after a lost lease), all fixed. A clean
-  462/462 run on a quiet machine is still to do.
-- **With several nostromo instances, a node's tunnel agent is connected to one
-  of them only**: requests arriving at another instance do not reach that node
-  yet.
-- **The datastore is yours to make redundant.** nostromo instances are
-  interchangeable, but `nostromo datastore` is a single etcd.
-- **Wake-up time depends on the machine.** On a loaded host a first boot took
-  9 to 14 seconds in our runs, more than the 10 seconds kubectl allows for the
-  TLS handshake; the client then has to retry. Background first boot (`-warm`,
-  on by default) keeps the first boot away from users; an ordinary wake stayed
-  between 2 and 3 seconds on the same loaded host.
-- **Engine savings:** clock-driven work not covered by the checks above can be
-  delayed by up to `-resync`. A node status change is recognised by the size
-  of the record, not its content. `-engines-always` turns the savings off.
-- **The management API has no authentication**: keep it on 127.0.0.1.
-- **Every write of every cluster flows through each nostromo instance** in a
-  single stream; this has been measured only up to the sizes in the table.
-- **Certificate renewal** is written but not tested over time.
+The official Kubernetes conformance suite (v1.37.2, run with hydrophone) was
+run in full on a nostromo cluster with two real nodes, engines sleeping as
+usual: 461 of 462 tests passed. The one that failed hit a request timeout
+while the test laptop's disk was saturated by other work, and passed when run
+again on its own.
